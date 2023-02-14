@@ -1,24 +1,60 @@
 # Zimbra Auto SSL
 
-Usage:
+A simple script that automatically fetches LetsEncrypt SSL and install them to your Zimbra Instance.
+
+## Usage
 
 ```plain
 Usage: zimbra-autossl.sh [option]
 
-Auto Letsencrypt SSL setup for Zimbra instance. This script allows automated deployment of SSL
-provided by LetsEncrypt.
+Auto Letsencrypt SSL setup for Zimbra instance.
+This script allows automated deployment of SSL provided by LetsEncrypt via cronjob.
 
 Options:
-  --deploy    Forces SSL certificate deployment.
+  -c --cron   Disables spinner.
+  -d --deploy Forces SSL certificate deployment.
               By default, if a certificate already issued by LE, the script will
               check the expiry date. If the days left (until expiry) doesn't meet
               the threshold yet, the script will exit. By setting this flag, the
               certificate will be deployed even if there's no new certificate issued.
+
   -h --help   Displays this info.
 ```
+On the first execution, the script will prompt you for some required data. Then it will be stored on a config file in `/etc/zimbra-autossl.conf`
 
-# To do
+Sample config file:
 
-- [ ] Better logging
-- [ ] Add a spinner?
+```plain
+renew_within = 7 # days
+email_address = "email@domain.tld"
+base_dir = "/opt/zimbra-autossl"
+
+# Do not the preceeding variable '${base_dir}'
+certs_dir = "${base_dir}/certs"
+caroot_dir = "${base_dir}/caroot"
+domain_list = "${base_dir}/ssldomains"
+
+ca_roots = [ isrgrootx1, isrg-root-x2, lets-encrypt-r3 ]
+```
+
+Demo:
+
+```
+root@zm1:~# ./zimbra-autossl.sh --deploy
+[✓] Stopping Zimbra Proxy temporarily
+[✓] Retrieving certificates
+[✓] Generating CA bundle
+[✓] Creating certificate bundle
+[✓] Verifying the certificate files
+[✓] Deploying certificates
+[✓] Killing remaining nginx processes
+[✓] Restarting Zimbra services
+All is done!
+```
+
+## To do
+
+- [ ] Better config parsing
+- [ ] Better wording
+- [x] Add a spinner?
 - [ ] ..

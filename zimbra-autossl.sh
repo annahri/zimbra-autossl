@@ -12,19 +12,41 @@ usage() {
     cat <<EOF
 Usage: $cmd [option]
 
-Auto Letsencrypt SSL setup for Zimbra instance. This script allows automated deployment of SSL
-provided by LetsEncrypt.
+Auto Letsencrypt SSL setup for Zimbra instance.
+This script allows automated deployment of SSL provided by LetsEncrypt.
 
 Options:
-  --deploy    Forces SSL certificate deployment.
+  -c --cron   Disables spinner.
+  -d --deploy Forces SSL certificate deployment.
               By default, if a certificate already issued by LE, the script will
               check the expiry date. If the days left (until expiry) doesn't meet
               the threshold yet, the script will exit. By setting this flag, the
               certificate will be deployed even if there's no new certificate issued.
+
   -h --help   Displays this info.
 EOF
 
     exit
+}
+
+process_wait() {
+    local pid="$1"
+    local msg="$2"
+    local spinner='-\|/'
+    local i=0
+
+    if [[ "$is_cron" == 1 ]]; then
+        echo "$2"
+        return
+    fi
+
+    while ps a | awk '{print $1}' | grep -q "$pid"; do
+        i=$(( (i+1) % 4 ))
+        printf '\r\033[2K[%s] %s' "${spinner:$i:1}" "$msg"
+        sleep .1
+    done
+
+    printf '\r\033[2K[✓] %s\n' "$msg"
 }
 
 runas() { 
@@ -139,7 +161,7 @@ get_ca_roots() {
 
 parse_args() {
     while [[ $# -ne 0 ]]; do case "$1" in
-        -c|--config) config_file="${2:-$config_file}"; shift ;;
+        -c|--cron) is_cron=1 ;;
         -d|--deploy) force_deploy=1 ;;
         -h|--help) usage ;;
         *)
@@ -195,22 +217,22 @@ main() {
     fi
 
     # Temporarily stop Zimbra Nginx instance
-    echo "Stopping Zimbra Proxy temporarily..."
-    runas 'zmproxyctl stop'
+    runas 'zmproxyctl stop' &> /dev/null &
+    process_wait "$!" "Stopping Zimbra Proxy temporarily"
 
     # Retrieve the certs
-    echo "Retrieving certificates..."
     certbot certonly --nginx -q -n \
         --agree-tos --email "$email_address" \
         --expand --cert-name "${ssl_domains[0]}" \
-        "${certbot_args[@]}"
+        "${certbot_args[@]}" &
+    process_wait "$!" "Retrieving certificates"
 
-    echo "Generating CA bundle..."
-    get_ca_roots
+    get_ca_roots &
+    process_wait "$!" "Generating CA bundle"
 
     # Create Certificate bundle
-    echo "Creating certificate bundle..."
-    cat "${letsencrypt_dir}/cert.pem" "${caroot_dir}/bundle.pem" > "${zimbra_ssl_dir}/bundle.pem"
+    cat "${letsencrypt_dir}/cert.pem" "${caroot_dir}/bundle.pem" > "${zimbra_ssl_dir}/bundle.pem" &
+    process_wait "$!" "Creating certificate bundle"
 
     # Copy the certs to Zimbra dir
     install --owner zimbra --group zimbra --preserve-timestamps \
@@ -221,11 +243,11 @@ main() {
         "${zimbra_ssl_dir}/privkey.pem"
 
     # Do certs verification
-    echo "Verifying the certificate files..."
     runas "zmcertmgr verifycrt comm \
         '${zimbra_ssl_dir}/privkey.pem' \
         '${zimbra_ssl_dir}/bundle.pem' \
-        '${caroot_dir}/bundle.pem'" &> /dev/null
+        '${caroot_dir}/bundle.pem'" &> /dev/null &
+    process_wait "$!" "Verifying the certificate files"
 
     # Overwrite the default comm privkey with the LE ones
     install --owner zimbra --group zimbra --preserve-timestamps \
@@ -233,21 +255,21 @@ main() {
         "/opt/zimbra/ssl/zimbra/commercial/commercial.key"
 
     # Deploy the certs
-    echo "Deploying certificates..."
     runas "zmcertmgr deploycrt comm \
         '${zimbra_ssl_dir}/bundle.pem' \
-        '${caroot_dir}/bundle.pem'" &> /dev/null
+        '${caroot_dir}/bundle.pem'" &> /dev/null &
+    process_wait "$!" "Deploying certificates"
 
     # Stop any lingering nginx processes
-    echo "Killing remaining nginx processes..."
-    pgrep --full '/usr/sbin/ngin[x]' &> /dev/null \
-        && nginx -s quit
+    { pgrep --full '/usr/sbin/ngin[x]' &> /dev/null \
+        && nginx -s quit; } &
+    process_wait "$!" "Killing remaining nginx processes"
 
     # Restart all zimbra services to apply the new certs
-    echo "Restarting Zimbra services..."
-    runas "zmcontrol restart" &> /dev/null
+    runas "zmcontrol restart" &> /dev/null &
+    process_wait "$!" "Restarting Zimbra services"
 
-    echo "Done"
+    echo "All is done!"
     trap -- ERR
 }
 
