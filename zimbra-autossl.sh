@@ -3,9 +3,12 @@ set -o errexit
 set -o errtrace
 set -o pipefail
 
-declare base_dir certs_dir caroot_dir domain_list renew_within email_address force_deploy
+declare base_dir certs_dir caroot_dir domain_list
+declare renew_within email_address force_deploy certs_only
 declare -a ca_roots
-config_file="/etc/zimbra-autossl.conf"
+
+config_dir="/etc/zimbra-autossl"
+config_file="${config_dir}/config"
 cmd=$(basename "$0")
 
 usage() {
@@ -15,19 +18,29 @@ Usage: $cmd [option]
 Auto LetsEncrypt SSL setup for Zimbra instance.
 This script allows automated deployment of SSL provided by LetsEncrypt using cronjob.
 
-A config file will be generated in /etc/zimbra-autossl.conf upon executing for the first time.
+A config file will be generated in $config_file upon executing for the first time.
 
 If you want to add more domains, please edit the ssldomains file.
 
 Options:
-  -c --cron   Disables spinner.
-  -d --deploy Forces SSL certificate deployment.
-              By default, if a certificate already issued by LE, the script will
-              check the expiry date. If the days left (until expiry) doesn't meet
-              the threshold yet, the script will exit. By setting this flag, the
-              certificate will be deployed even if there's no new certificate issued.
+  -c --cron   
+    Disables spinner and enter non-interactive mode.
+  -C --certsonly
+    Only do certificate request.
+  -d --deploy 
+    Forces SSL certificate deployment.
+    By default, if a certificate already issued by LE, the script will
+    check the expiry date. If the days left (until expiry) doesn't meet
+    the threshold yet, the script will exit. By setting this flag, the
+    certificate will be deployed even if there's no new certificate issued.
 
-  -h --help   Displays this info.
+  -h --help   
+    Displays this info.
+
+Info:
+
+Option -C|--certsonly and -d|--deploy, cannot be set together. The latter will unset the precedent.
+Example: \`$cmd -C -d\` => The -C option will be disregarded. And vice-versa.
 EOF
 
     exit
@@ -41,6 +54,7 @@ process_wait() {
 
     if [[ "$is_cron" == 1 ]]; then
         echo "$2"
+        wait "$pid"
         return
     fi
 
@@ -89,7 +103,7 @@ check_config() {
     echo "First time run. Please fill in the required values below."
     echo "Enter your email address for cert expiration alerts."
     read -r -p "Address: " email
-    mkdir -p "/etc/zimbra-autossl/"
+    mkdir -p "$config_dir"
 
     cat <<EOF | tee "$config_file" > /dev/null
 renew_within = 7 # days
@@ -139,12 +153,27 @@ check_dependencies() {
     esac
 }
 
+prompt() {
+    [[ $is_cron == 1 ]] && return
+    read -r -p "${1} (y) "
+    [[ $REPLY =~ [yY] ]] && return
+    exit
+}
+
+choice() {
+    [[ $is_cron == 1 ]] && return
+    read -r -p "${1} (y) "
+    [[ $REPLY =~ [yY] ]] && return
+    return 1        
+}
+
 script_fail() {
     # This function will be executen when the script doesn't exit with 0
     # This will kill any non-zimbra nginx instances and start the zimbra ones
-    echo "Auto SSL failed." >&2
+    echo "Script doesn't exit properly" >&2
     pgrep --full '/usr/sbin/ngin[x]' &> /dev/null && nginx -s quit
-    runas "zmproxyctl start"
+    runas "zmproxyctl start" &
+    process_wait "$!" "Starting Zimbra Proxy"
 }
 
 trap 'script_fail' ERR INT TERM
@@ -164,7 +193,10 @@ get_ca_roots() {
 parse_args() {
     while [[ $# -ne 0 ]]; do case "$1" in
         -c|--cron) is_cron=1 ;;
-        -d|--deploy) force_deploy=1 ;;
+        -C|--certsonly)
+            unset force_deploy; certs_only=1 ;;
+        -d|--deploy)
+            unset certs_only; force_deploy=1 ;;
         -h|--help) usage ;;
         *)
             echo "Unknown option: $1"
@@ -218,31 +250,45 @@ main() {
         fi
     fi
 
-    # Temporarily stop Zimbra Nginx instance
-    runas 'zmproxyctl stop' &> /dev/null &
-    process_wait "$!" "Stopping Zimbra Proxy temporarily"
+    if [[ "$force_deploy" == 1 ]]; then
+        if [[  ! -f "${zimbra_ssl_dir}/privkey.pem" \
+            || ! -f "${zimbra_ssl_dir}/bundle.pem" \
+            || ! -f "${caroot_dir}/bundle.pem" \
+            || ! -f "${letsencrypt_dir}/privkey.pem" ]]; then
+            
+            echo "The required certificate files not found. Please do a complete run first." >&2
+            exit 4
+        fi
+    else
+        prompt "Stopping Zimbra Proxy to request the certificate. Continue?"
+        # Temporarily stop Zimbra Nginx instance
+        runas 'zmproxyctl stop' &> /dev/null &
+        process_wait "$!" "Stopping Zimbra Proxy temporarily"
 
-    # Retrieve the certs
-    certbot certonly --nginx -q -n \
-        --agree-tos --email "$email_address" \
-        --expand --cert-name "${ssl_domains[0]}" \
-        "${certbot_args[@]}" &
-    process_wait "$!" "Retrieving certificates"
+        # Retrieve the certs
+        certbot certonly --nginx -q -n \
+            --agree-tos --email "$email_address" \
+            --expand --cert-name "${ssl_domains[0]}" \
+            "${certbot_args[@]}" &
+        process_wait "$!" "Retrieving certificates"
 
-    get_ca_roots &
-    process_wait "$!" "Generating CA bundle"
+        get_ca_roots &
+        process_wait "$!" "Generating CA bundle"
 
-    # Create Certificate bundle
-    cat "${letsencrypt_dir}/cert.pem" "${caroot_dir}/bundle.pem" > "${zimbra_ssl_dir}/bundle.pem" &
-    process_wait "$!" "Creating certificate bundle"
+        # Create Certificate bundle
+        cat "${letsencrypt_dir}/cert.pem" "${caroot_dir}/bundle.pem" > "${zimbra_ssl_dir}/bundle.pem" &
+        process_wait "$!" "Creating certificate bundle"
 
-    # Copy the certs to Zimbra dir
-    install --owner zimbra --group zimbra --preserve-timestamps \
-        "${letsencrypt_dir}/cert.pem" \
-        "${zimbra_ssl_dir}/cert.pem"
-    install --owner zimbra --group zimbra --preserve-timestamps \
-        "${letsencrypt_dir}/privkey.pem" \
-        "${zimbra_ssl_dir}/privkey.pem"
+        # Copy the certs to Zimbra dir
+        install --owner zimbra --group zimbra --preserve-timestamps \
+            "${letsencrypt_dir}/cert.pem" \
+            "${zimbra_ssl_dir}/cert.pem"
+        install --owner zimbra --group zimbra --preserve-timestamps \
+            "${letsencrypt_dir}/privkey.pem" \
+            "${zimbra_ssl_dir}/privkey.pem"
+    fi
+
+    [[ "$certs_only" == 1 ]] && exit 0
 
     # Do certs verification
     runas "zmcertmgr verifycrt comm \
@@ -252,11 +298,15 @@ main() {
     process_wait "$!" "Verifying the certificate files"
 
     # Overwrite the default comm privkey with the LE ones
-    install --owner zimbra --group zimbra --preserve-timestamps \
-        "${letsencrypt_dir}/privkey.pem" \
-        "/opt/zimbra/ssl/zimbra/commercial/commercial.key"
+    # if it's different (means, new)
+    if diff -q "${letsencrypt_dir}" "/opt/zimbra/ssl/zimbra/commercial/commercial.key" > /dev/null; then
+        install --owner zimbra --group zimbra --preserve-timestamps \
+            "${letsencrypt_dir}/privkey.pem" \
+            "/opt/zimbra/ssl/zimbra/commercial/commercial.key"
+    fi
 
     # Deploy the certs
+    prompt "Deploy the certs?"
     runas "zmcertmgr deploycrt comm \
         '${zimbra_ssl_dir}/bundle.pem' \
         '${caroot_dir}/bundle.pem'" &> /dev/null &
@@ -268,10 +318,15 @@ main() {
     process_wait "$!" "Killing remaining nginx processes"
 
     # Restart all zimbra services to apply the new certs
-    runas "zmcontrol restart" &> /dev/null &
-    process_wait "$!" "Restarting Zimbra services"
+    if choice "Restart Zimbra services now?"; then
+        runas "zmcontrol restart" &> /dev/null &
+        process_wait "$!" "Restarting Zimbra services"
+        echo "All is done!"
 
-    echo "All is done!"
+    else
+        echo "Please restart Zimbra services manually via: sudo -i -u zimbra zmcontrol restart"
+    fi
+
     trap -- ERR
 }
 
