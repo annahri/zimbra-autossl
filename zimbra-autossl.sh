@@ -12,8 +12,12 @@ usage() {
     cat <<EOF
 Usage: $cmd [option]
 
-Auto Letsencrypt SSL setup for Zimbra instance.
-This script allows automated deployment of SSL provided by LetsEncrypt.
+Auto LetsEncrypt SSL setup for Zimbra instance.
+This script allows automated deployment of SSL provided by LetsEncrypt using cronjob.
+
+A config file will be generated in /etc/zimbra-autossl.conf upon executing for the first time.
+
+If you want to add more domains, please edit the ssldomains file.
 
 Options:
   -c --cron   Disables spinner.
@@ -85,14 +89,12 @@ check_config() {
     echo "First time run. Please fill in the required values below."
     echo "Enter your email address for cert expiration alerts."
     read -r -p "Address: " email
-    echo "This should be the directory where all the generated certs will be stored." 
-    read -r -p "E.g /home/user/zimrba-autossl, /opt/zimbra-autossl : " artifacts_dir
-    mkdir -p "${artifacts_dir%/}"
+    mkdir -p "/etc/zimbra-autossl/"
 
     cat <<EOF | tee "$config_file" > /dev/null
 renew_within = 7 # days
 email_address = "${email}"
-base_dir = "${artifacts_dir%/}"
+base_dir = "${config_dir%/}"
 
 # Do not modify the below lines
 certs_dir = "\${base_dir}/certs"
@@ -104,7 +106,7 @@ EOF
     echo "Please enter the domain names (space separated)."
     read -a domains -r -p "The first domain would be the main domain: "
 
-    printf '%s\n' "${domains[@]}" | tee "${artifacts_dir%/}/ssldomains"
+    printf '%s\n' "${domains[@]}" | tee "${config_dir%/}/ssldomains"
 }
 
 check_dependencies() {
