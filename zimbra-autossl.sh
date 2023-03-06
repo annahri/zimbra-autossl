@@ -4,7 +4,7 @@ set -o errtrace
 set -o pipefail
 
 declare base_dir certs_dir caroot_dir domain_list
-declare renew_within email_address force_deploy certs_only
+declare renew_within email_address force_deploy get_certs_only
 declare -a ca_roots
 
 config_dir="/etc/zimbra-autossl"
@@ -33,6 +33,8 @@ Options:
     check the expiry date. If the days left (until expiry) doesn't meet
     the threshold yet, the script will exit. By setting this flag, the
     certificate will be deployed even if there's no new certificate issued.
+  -g --getca
+    Only get CA certificates for LetsEncrypt.
 
   -h --help   
     Displays this info.
@@ -49,14 +51,15 @@ EOF
 process_wait() {
     local pid="$1"
     local msg="$2"
-    local spinner='-\|/'
-    local i=0
 
     if [[ "$is_cron" == 1 ]]; then
         echo "$2"
         wait "$pid"
         return
     fi
+
+    local spinner='-\|/'
+    local i=0
 
     while ps a | awk '{print $1}' | grep -q "$pid"; do
         i=$(( (i+1) % 4 ))
@@ -125,10 +128,10 @@ EOF
 
 check_dependencies() {
     if ! command -v certbot &> /dev/null; then
-        echo "Certbot is required. Please install using:" >&2
-        echo "  apt install certbot" >&2
-        echo "    or" >&2
-        echo "  dnf install certbot" >&2
+        echo "Certbot is required. Please install using:"
+        echo "  apt install certbot"
+        echo "    or"
+        echo "  dnf install certbot"
         exit 3
     fi
 
@@ -137,16 +140,16 @@ check_dependencies() {
             output=$(dpkg -l | grep 'python3-certbot-nginx' || true)
             # shellcheck disable=2181
             if [[ -z "$output" ]] ; then
-                echo "This script requires python3-certbot-nginx plugin. Please install using:" >&2
-                echo "  apt install python3-certbot-nginx" >&2
+                echo "This script requires python3-certbot-nginx plugin. Please install using:"
+                echo "  apt install python3-certbot-nginx"
                 exit
             fi
             ;;
         *rhel*)
             output=$(rpm -qa | grep 'python3-certbot-nginx' || true)
             if [[ -z "$output" ]]; then
-                echo "This script requires python3-certbot-nginx plugin. Please install using:" >&2
-                echo "  dnf install python3-certbot-nginx" >&2
+                echo "This script requires python3-certbot-nginx plugin. Please install using:"
+                echo "  dnf install python3-certbot-nginx"
                 exit
             fi
             ;;
@@ -170,10 +173,11 @@ choice() {
 script_fail() {
     # This function will be executen when the script doesn't exit with 0
     # This will kill any non-zimbra nginx instances and start the zimbra ones
-    echo "Script doesn't exit properly" >&2
+    echo "Script doesn't exit properly"
     pgrep --full '/usr/sbin/ngin[x]' &> /dev/null && nginx -s quit
-    runas "zmproxyctl start" &
+    runas "zmproxyctl start" &> /dev/null &
     process_wait "$!" "Starting Zimbra Proxy"
+    exit 6
 }
 
 trap 'script_fail' ERR INT TERM
@@ -182,7 +186,7 @@ get_ca_roots() {
     # Check ca roots
     for ca in "${ca_roots[@]}"; do
         if [[ ! -f "${caroot_dir}/${ca}.pem" ]]; then
-            curl -s --output "${caroot_dir}/${ca}.pem" "https://letsencrypt.org/certs/${ca}.pem"
+            curl -s -o "${caroot_dir}/${ca}.pem" "https://letsencrypt.org/certs/${ca}.pem"
         fi
 
         tee -a "${caroot_dir}/bundle.pem" < "${caroot_dir}/${ca}.pem" > /dev/null
@@ -194,9 +198,10 @@ parse_args() {
     while [[ $# -ne 0 ]]; do case "$1" in
         -c|--cron) is_cron=1 ;;
         -C|--certsonly)
-            unset force_deploy; certs_only=1 ;;
+            unset force_deploy; get_certs_only=1 ;;
         -d|--deploy)
-            unset certs_only; force_deploy=1 ;;
+            unset get_certs_only; force_deploy=1 ;;
+        -g|--getca) get_ca_only=1 ;;
         -h|--help) usage ;;
         *)
             echo "Unknown option: $1"
@@ -206,10 +211,11 @@ parse_args() {
 }
 
 main() {
+    exec >&2
     parse_args "$@"
 
     if [[ $EUID -ne 0 ]]; then
-        echo "This script needs to be run as root." >&2
+        echo "This script needs to be run as root."
         exit
     fi
 
@@ -220,14 +226,14 @@ main() {
     mkdir -p "$base_dir" "$certs_dir" "$caroot_dir"
 
     if [[ ! -f "$domain_list" ]]; then
-        echo "$domain_list file doesn't exist." >&2
+        echo "$domain_list file doesn't exist."
         exit 1
     fi
 
     if [[ ! -s "$domain_list" ]]; then
-        echo "Domains cannot be empty." >&2
-        echo "Please fill the $domain_list, with the domain list." >&2
-        echo "The first line is going to be the main domain." >&2
+        echo "Domains cannot be empty."
+        echo "Please fill the $domain_list, with the domain list."
+        echo "The first line is going to be the main domain."
         exit 2
     fi
 
@@ -241,54 +247,60 @@ main() {
     zimbra_ssl_dir="/opt/zimbra/ssl/${ssl_domains[0]}"
     mkdir -p "$zimbra_ssl_dir"
 
+    get_ca_roots &
+    process_wait "$!" "Getting CA certificates for LetsEncrypt"
+
+    [[ "$get_ca_only" == 1 ]] && exit
+
     if [[ -d "$letsencrypt_dir" && -z "$force_deploy" ]]; then
         days_left="$(certbot certificates 2> /dev/null | grep -A1 "Domains: ${ssl_domains[0]}" | grep VALID | sed 's/.*(VALID: \(.*\) days.*/\1/')"
 
+        if [[ -z "$days_left" ]]; then
+            echo "Cannot retrieve the certbot certificates. Please run the following manually and check the errors:"
+            echo "  certbot certificates"
+            exit 1
+        fi
+
         if [[ $days_left -gt $renew_within ]]; then
-            echo "Certificate is not within renewal days ($renew_within days before expiration). Exit" >&2
-            exit 0
+            echo "Certificate is not within renewal days ($renew_within days before expiration). Exit"
+            exit
         fi
     fi
 
-    if [[ "$force_deploy" == 1 ]]; then
-        if [[  ! -f "${zimbra_ssl_dir}/privkey.pem" \
-            || ! -f "${zimbra_ssl_dir}/bundle.pem" \
-            || ! -f "${caroot_dir}/bundle.pem" \
-            || ! -f "${letsencrypt_dir}/privkey.pem" ]]; then
-            
-            echo "The required certificate files not found. Please do a complete run first." >&2
-            exit 4
-        fi
-    else
-        prompt "Stopping Zimbra Proxy to request the certificate. Continue?"
-        # Temporarily stop Zimbra Nginx instance
-        runas 'zmproxyctl stop' &> /dev/null &
-        process_wait "$!" "Stopping Zimbra Proxy temporarily"
-
-        # Retrieve the certs
-        certbot certonly --nginx -q -n \
-            --agree-tos --email "$email_address" \
-            --expand --cert-name "${ssl_domains[0]}" \
-            "${certbot_args[@]}" &
-        process_wait "$!" "Retrieving certificates"
-
-        get_ca_roots &
-        process_wait "$!" "Generating CA bundle"
-
-        # Create Certificate bundle
-        cat "${letsencrypt_dir}/cert.pem" "${caroot_dir}/bundle.pem" > "${zimbra_ssl_dir}/bundle.pem" &
-        process_wait "$!" "Creating certificate bundle"
-
-        # Copy the certs to Zimbra dir
-        install --owner zimbra --group zimbra --preserve-timestamps \
-            "${letsencrypt_dir}/cert.pem" \
-            "${zimbra_ssl_dir}/cert.pem"
-        install --owner zimbra --group zimbra --preserve-timestamps \
-            "${letsencrypt_dir}/privkey.pem" \
-            "${zimbra_ssl_dir}/privkey.pem"
+    if [[ "$force_deploy" == 1 ]] && [[ ! -f "${zimbra_ssl_dir}/privkey.pem" \
+        || ! -f "${zimbra_ssl_dir}/bundle.pem" \
+        || ! -f "${caroot_dir}/bundle.pem" \
+        || ! -f "${letsencrypt_dir}/privkey.pem" ]]; then
+        
+        echo "The required certificate files not found. Please do a complete run first."
+        exit 4
     fi
 
-    [[ "$certs_only" == 1 ]] && exit 0
+    prompt "Stopping Zimbra Proxy to request the certificate. Continue?"
+    # Temporarily stop Zimbra Nginx instance
+    runas 'zmproxyctl stop' &> /dev/null &
+    process_wait "$!" "Stopping Zimbra Proxy temporarily"
+
+    # Retrieve the certs
+    certbot certonly --nginx -q -n \
+        --agree-tos --email "$email_address" \
+        --expand --cert-name "${ssl_domains[0]}" \
+        "${certbot_args[@]}" &
+    process_wait "$!" "Retrieving certificates"
+
+    # Create Certificate bundle
+    cat "${letsencrypt_dir}/cert.pem" "${caroot_dir}/bundle.pem" > "${zimbra_ssl_dir}/bundle.pem" &
+    process_wait "$!" "Creating certificate bundle"
+
+    # Copy the certs to Zimbra dir
+    install --owner zimbra --group zimbra --preserve-timestamps \
+        "${letsencrypt_dir}/cert.pem" \
+        "${zimbra_ssl_dir}/cert.pem"
+    install --owner zimbra --group zimbra --preserve-timestamps \
+        "${letsencrypt_dir}/privkey.pem" \
+        "${zimbra_ssl_dir}/privkey.pem"
+
+    [[ "$get_certs_only" == 1 ]] && exit 0
 
     # Do certs verification
     runas "zmcertmgr verifycrt comm \
@@ -322,9 +334,9 @@ main() {
         runas "zmcontrol restart" &> /dev/null &
         process_wait "$!" "Restarting Zimbra services"
         echo "All is done!"
-
     else
-        echo "Please restart Zimbra services manually via: sudo -i -u zimbra zmcontrol restart"
+        echo "Please restart Zimbra services manually using:" 
+        echo "  sudo -i -u zimbra zmcontrol restart"
     fi
 
     trap -- ERR
